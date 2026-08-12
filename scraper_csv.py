@@ -1,16 +1,11 @@
-"""Download the FDA recalls workbook and save it as a CSV file."""
-
 import csv
-import html
-import random
+import os
 import tempfile
 from datetime import date, datetime
 from pathlib import Path
-from urllib.parse import urljoin
 
+import requests
 from openpyxl import load_workbook
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
 
 
 FDA_URL = (
@@ -22,83 +17,67 @@ OUTPUT_PATH = Path("data/fda_recalls.csv")
 
 
 def download_workbook(destination: Path) -> None:
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context(
-            accept_downloads=True,
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/131 Safari/537.36"
-            ),
+    token = os.environ["BROWSERLESS_TOKEN"]
+
+    browserless_url = (
+        "https://production-sfo.browserless.io/"
+        f"download?token={token}"
+    )
+
+    browser_code = f"""
+export default async ({{ page }}) => {{
+  await page.goto({FDA_URL!r}, {{
+    waitUntil: "networkidle2",
+    timeout: 60000
+  }});
+
+  const link = await page.$(
+    'a[href*="datatables-data"][href*="_format=xlsx"]'
+  );
+
+  if (!link) {{
+    throw new Error("FDA XLSX download link was not found.");
+  }}
+
+  await link.click();
+
+  // Allow the browser download to finish.
+  await new Promise(resolve => setTimeout(resolve, 8000));
+}};
+"""
+
+    response = requests.post(
+        browserless_url,
+        headers={"Content-Type": "application/javascript"},
+        data=browser_code,
+        timeout=120,
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Browserless download failed: "
+            f"{response.status_code}\n"
+            f"{response.text[:1000]}"
         )
 
-        try:
-            page = context.new_page()
-            page.goto(
-                FDA_URL,
-                wait_until="domcontentloaded",
-                timeout=60_000,
-            )
+    content_type = response.headers.get("content-type", "")
 
-            link = page.locator(
-                'a[href*="datatables-data"][href*="_format=xlsx"]'
-            ).first
+    if (
+        "spreadsheet" not in content_type
+        and "excel" not in content_type
+        and not response.content.startswith(b"PK")
+    ):
+        raise RuntimeError(
+            "Browserless returned an unexpected file type: "
+            f"{content_type}\n"
+            f"{response.text[:500]}"
+        )
 
-            try:
-                href = link.get_attribute(
-                    "href",
-                    timeout=30_000,
-                )
-            except PlaywrightTimeoutError:
-                href = None
-
-            if href:
-                download_url = urljoin(
-                    FDA_URL,
-                    html.unescape(href),
-                )
-
-                with page.expect_download(
-                    timeout=60_000
-                ) as download_info:
-                    link.click(force=True)
-
-                download_info.value.save_as(
-                    str(destination)
-                )
-
-                print(f"Downloaded: {download_url}")
-
-            else:
-                download_url = (
-                    f"{FDA_URL}/datatables-data"
-                    f"?randparam={random.randint(100000, 999999)}"
-                    "&page&_format=xlsx"
-                )
-
-                with page.expect_download(
-                    timeout=60_000
-                ) as download_info:
-                    page.goto(
-                        download_url,
-                        wait_until="commit",
-                        timeout=60_000,
-                    )
-
-                download_info.value.save_as(
-                    str(destination)
-                )
-
-                print(f"Downloaded fallback URL: {download_url}")
-
-        finally:
-            context.close()
-            browser.close()
+    destination.write_bytes(response.content)
+    print(f"Downloaded {len(response.content)} bytes.")
 
 
-def normalize_cell(value: object) -> object:
+def normalize_cell(value):
     if value is None:
         return ""
 

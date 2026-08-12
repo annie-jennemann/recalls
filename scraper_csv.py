@@ -1,7 +1,10 @@
 import csv
+import html
+import random
 import tempfile
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import urljoin
 
 from openpyxl import load_workbook
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -15,20 +18,55 @@ OUTPUT_PATH = Path("data/fda_recalls.csv")
 def download_workbook(destination: Path) -> None:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(
+            accept_downloads=True,
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131 Safari/537.36"
+            ),
+        )
         try:
-            page = browser.new_page(accept_downloads=True)
+            page = context.new_page()
             page.goto(FDA_URL, wait_until="domcontentloaded", timeout=60_000)
-            link = page.locator(
-                'a[href*="datatables-data"][href*="_format=xlsx"]'
-            ).first
-            link.wait_for(state="visible", timeout=30_000)
 
-            with page.expect_download(timeout=60_000) as download_info:
-                link.click()
-            download_info.value.save_as(str(destination))
+            # The link can be hidden by the FDA page's responsive layout. Read
+            # its href from the DOM instead of requiring it to be visible.
+            link = page.locator(
+                '[href*="datatables-data"][href*="_format=xlsx"]'
+            ).first
+            try:
+                href = link.get_attribute("href", timeout=30_000)
+            except PlaywrightTimeoutError:
+                href = None
+
+            if href:
+                download_url = urljoin(FDA_URL, html.unescape(href))
+            else:
+                # Fallback if the page layout changes but the XLSX endpoint
+                # remains available.
+                download_url = (
+                    f"{FDA_URL}/datatables-data?randparam="
+                    f"{random.randint(100000, 999999)}"
+                    "&page&_format=xlsx"
+                )
+
+            response = context.request.get(
+                download_url,
+                timeout=60_000,
+                headers={
+                    "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "Referer": FDA_URL,
+                },
+            )
+            if not response.ok:
+                raise RuntimeError(
+                    f"FDA XLSX request failed: {response.status} {download_url}"
+                )
+            destination.write_bytes(response.body())
         except PlaywrightTimeoutError as exc:
             raise RuntimeError("The FDA XLSX download link did not load in time.") from exc
         finally:
+            context.close()
             browser.close()
 
 
